@@ -57,14 +57,26 @@ typedef DWORD (WINAPI *PFN_XInputGetState)(DWORD, XINPUT_STATE*);
 //  2017-10-23: Inputs: Using Win32 ::SetCapture/::GetCapture() to retrieve mouse positions outside the client area when dragging.
 //  2016-11-12: Inputs: Only call Win32 ::SetCursor(NULL) when io.MouseDrawCursor is set.
 
+#include <glad/glad_wgl.h>
+
+enum Win32ClientAPI
+{
+    Win32ClientApi_Unknown,
+    Win32ClientApi_OpenGL,
+    Win32ClientAPI_DirectX12,
+    Win32ClientAPI_Vulkan
+};
+
 // Win32 Data
 static HWND                 g_hWnd = NULL;
+static Win32ClientAPI       g_clientAPI = Win32ClientApi_Unknown;
 static INT64                g_Time = 0;
 static INT64                g_TicksPerSecond = 0;
 static ImGuiMouseCursor     g_LastMouseCursor = ImGuiMouseCursor_COUNT;
 static bool                 g_HasGamepad = false;
 static bool                 g_WantUpdateHasGamepad = true;
 static bool                 g_WantUpdateMonitors = true;
+static HGLRC                g_MainGlContext = 0;
 
 // Forward Declarations
 static void ImGui_ImplWin32_InitPlatformInterface();
@@ -79,12 +91,14 @@ static PFN_XInputGetState           g_XInputGetState = NULL;
 #endif
 
 // Functions
-bool    ImGui_ImplWin32_Init(void* hwnd)
+bool    ImGui_ImplWin32_Init(void* hwnd, Win32ClientAPI clientAPI)
 {
     if (!::QueryPerformanceFrequency((LARGE_INTEGER*)&g_TicksPerSecond))
         return false;
     if (!::QueryPerformanceCounter((LARGE_INTEGER*)&g_Time))
         return false;
+
+    g_clientAPI = clientAPI;
 
     // Setup backend capabilities flags
     ImGuiIO& io = ImGui::GetIO();
@@ -98,6 +112,8 @@ bool    ImGui_ImplWin32_Init(void* hwnd)
     g_hWnd = (HWND)hwnd;
     ImGuiViewport* main_viewport = ImGui::GetMainViewport();
     main_viewport->PlatformHandle = main_viewport->PlatformHandleRaw = (void*)g_hWnd;
+    g_MainGlContext = wglGetCurrentContext();
+
     if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
         ImGui_ImplWin32_InitPlatformInterface();
 
@@ -144,8 +160,17 @@ bool    ImGui_ImplWin32_Init(void* hwnd)
             break;
         }
 #endif // IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
-    
     return true;
+}
+
+bool    ImGui_ImplWin32_InitForOpenGL(void* hwnd)
+{
+    return ImGui_ImplWin32_Init(hwnd, Win32ClientApi_OpenGL);
+}
+
+bool    ImGui_ImplWin32_InitForDirectX12(void* hwnd)
+{
+    return ImGui_ImplWin32_Init(hwnd, Win32ClientAPI_DirectX12);
 }
 
 void    ImGui_ImplWin32_Shutdown()
@@ -618,11 +643,12 @@ static void ImGui_ImplWin32_SetImeInputPos(ImGuiViewport* viewport, ImVec2 pos)
 struct ImGuiViewportDataWin32
 {
     HWND    Hwnd;
+    HDC     Hdc;
     bool    HwndOwned;
     DWORD   DwStyle;
     DWORD   DwExStyle;
 
-    ImGuiViewportDataWin32() { Hwnd = NULL; HwndOwned = false;  DwStyle = DwExStyle = 0; }
+    ImGuiViewportDataWin32() { Hwnd = NULL; Hdc = NULL; HwndOwned = false;  DwStyle = DwExStyle = 0; }
     ~ImGuiViewportDataWin32() { IM_ASSERT(Hwnd == NULL); }
 };
 
@@ -661,9 +687,26 @@ static void ImGui_ImplWin32_CreateWindow(ImGuiViewport* viewport)
         data->DwExStyle, _T("ImGui Platform"), _T("Untitled"), data->DwStyle,   // Style, class name, window name
         rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,    // Window area
         parent_window, NULL, ::GetModuleHandle(NULL), NULL);                    // Parent window, Menu, Instance, Param
+    data->Hdc = GetDC(data->Hwnd);
     data->HwndOwned = true;
     viewport->PlatformRequestResize = false;
     viewport->PlatformHandle = viewport->PlatformHandleRaw = data->Hwnd;
+
+    if (g_clientAPI == Win32ClientApi_OpenGL)
+    {
+        //Set the childs window to the same GL Context of the main along with its parents PixelFormat
+        HDC mainHDC = GetDC(g_hWnd);
+        //HDC childHDC = GetDC(data->Hwnd);
+
+        PIXELFORMATDESCRIPTOR pfd = {};
+        int pixelFormat = GetPixelFormat(mainHDC);
+        DescribePixelFormat(mainHDC, pixelFormat, sizeof(PIXELFORMATDESCRIPTOR), &pfd);
+        SetPixelFormat(data->Hdc, pixelFormat, &pfd);
+
+        //Set it to current so we can render to it.
+        wglMakeCurrent(data->Hdc, g_MainGlContext);
+        wglSwapIntervalEXT(0);
+    }
 }
 
 static void ImGui_ImplWin32_DestroyWindow(ImGuiViewport* viewport)
@@ -837,6 +880,24 @@ static void ImGui_ImplWin32_OnChangedViewport(ImGuiViewport* viewport)
 #endif
 }
 
+static void ImGui_ImplWin32_RenderWindow(ImGuiViewport* viewport, void*)
+{
+    ImGuiViewportDataWin32* data = (ImGuiViewportDataWin32*)viewport->PlatformUserData;
+    if (g_clientAPI == Win32ClientApi_OpenGL)
+    {
+        wglMakeCurrent(data->Hdc, g_MainGlContext);
+    }
+}
+
+static void ImGui_ImplWin32_SwapBuffers(ImGuiViewport* viewport, void*)
+{
+    ImGuiViewportDataWin32* data = (ImGuiViewportDataWin32*)viewport->PlatformUserData;
+    if (g_clientAPI == Win32ClientApi_OpenGL)
+    {
+        ::SwapBuffers(data->Hdc);
+    }
+}
+
 static LRESULT CALLBACK ImGui_ImplWin32_WndProcHandler_PlatformWindow(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
@@ -912,6 +973,11 @@ static void ImGui_ImplWin32_InitPlatformInterface()
 #if HAS_WIN32_IME
     platform_io.Platform_SetImeInputPos = ImGui_ImplWin32_SetImeInputPos;
 #endif
+    if (g_clientAPI == Win32ClientApi_OpenGL)
+    {
+        platform_io.Platform_RenderWindow = ImGui_ImplWin32_RenderWindow;
+        platform_io.Platform_SwapBuffers = ImGui_ImplWin32_SwapBuffers;
+    }
 
     // Register main window handle (which is owned by the main application, not by us)
     // This is mostly for simplicity and consistency, so that our code (e.g. mouse handling etc.) can use same logic for main and secondary viewports.
